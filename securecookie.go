@@ -26,7 +26,6 @@ func init() {
 var (
 	ErrKeyLength        = fmt.Errorf("the key must be %d bytes", chacha20poly1305.KeySize)
 	ErrDecryptionFailed = fmt.Errorf("the value could not be decrypted")
-	ErrNoCodecs         = fmt.Errorf("no codecs provided")
 	ErrValueNotByte     = fmt.Errorf("the value is not a []byte")
 	ErrValueNotBytePtr  = fmt.Errorf("the value is not a *[]byte")
 	ErrValueTooLong     = fmt.Errorf("the value is too long")
@@ -292,76 +291,3 @@ func GenerateRandomKey(length int) []byte {
 	return b
 }
 
-// EncodeMulti encodes a cookie value using a group of codecs.
-//
-// The codecs are tried in order. Multiple codecs are accepted to allow
-// key rotation.
-//
-// On error, may return a MultiError.
-func EncodeMulti(name string, value any, codecs ...Codec) (string, error) {
-	if len(codecs) == 0 {
-		return "", ErrNoCodecs
-	}
-
-	var errors MultiError
-	for _, codec := range codecs {
-		encoded, err := codec.Encode(name, value)
-		if err == nil {
-			return encoded, nil
-		}
-		errors = append(errors, err)
-	}
-	return "", errors
-}
-
-// DecodeMulti decodes a cookie value using a group of codecs.
-//
-// The codecs are tried in order. Multiple codecs are accepted to allow
-// key rotation.
-//
-// On error, may return a MultiError.
-func DecodeMulti(name string, value string, dst any, codecs ...Codec) error {
-	if len(codecs) == 0 {
-		return ErrNoCodecs
-	}
-
-	var errors MultiError
-	for _, codec := range codecs {
-		_, err := codec.Decode(name, value, dst)
-		if err == nil {
-			return nil
-		}
-		errors = append(errors, err)
-	}
-	return errors
-}
-
-// MultiError groups multiple errors.
-type MultiError []error
-
-func (m MultiError) Error() string {
-	s, n := "", 0
-	for _, e := range m {
-		if e != nil {
-			if n == 0 {
-				s = e.Error()
-			}
-			n++
-		}
-	}
-	switch n {
-	case 0:
-		return "(0 errors)"
-	case 1:
-		return s
-	case 2:
-		return s + " (and 1 other error)"
-	}
-	return fmt.Sprintf("%s (and %d other errors)", s, n-1)
-}
-
-// Unwrap returns the grouped errors, allowing errors.Is and errors.As to
-// examine each of them.
-func (m MultiError) Unwrap() []error {
-	return m
-}

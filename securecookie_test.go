@@ -181,38 +181,17 @@ func TestEncoding(t *testing.T) {
 	}
 }
 
-func TestMultiError(t *testing.T) {
-	s1, err1 := New([]byte("12345678901234567890123456789012"), DefaultOptions)
-	s2, err2 := New([]byte("abcdefghijklmnopqrstuvwxyz123456"), DefaultOptions)
-	if err1 != nil {
-		t.Fatal(err1)
+func TestEncodeUnsupportedValue(t *testing.T) {
+	s1, err := New([]byte("12345678901234567890123456789012"), DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err2 != nil {
-		t.Fatal(err2)
-	}
-	_, err := EncodeMulti("sid", New, s1, s2)
-	if err == nil {
+	// Functions cannot be serialized to JSON.
+	if _, err = s1.Encode("sid", New); err == nil {
 		t.Fatal("Expected failure encoding.")
 	}
-	if len(err.(MultiError)) != 2 {
-		t.Errorf("Expected 2 errors, got %s.", err)
-	} else {
-		if !strings.Contains(err.Error(), "unsupported type") {
-			t.Errorf("Expected unsupported type error, got %s.", err.Error())
-		}
-	}
-}
-
-func TestMultiNoCodecs(t *testing.T) {
-	_, err := EncodeMulti("foo", "bar")
-	if !errors.Is(err, ErrNoCodecs) {
-		t.Errorf("EncodeMulti: bad value for error, got: %#v", err)
-	}
-
-	var dst []byte
-	err = DecodeMulti("foo", "bar", &dst)
-	if !errors.Is(err, ErrNoCodecs) {
-		t.Errorf("DecodeMulti: bad value for error, got: %#v", err)
+	if !strings.Contains(err.Error(), "unsupported type") {
+		t.Errorf("Expected unsupported type error, got %s.", err.Error())
 	}
 }
 
@@ -461,27 +440,6 @@ func TestNewDoesNotMutateOptions(t *testing.T) {
 	}
 	if opts.Serializer != nil || opts.TimeFunc != nil {
 		t.Fatalf("New mutated the caller's Options: %#v", opts)
-	}
-}
-
-func TestMultiErrorUnwrap(t *testing.T) {
-	s1, err := New([]byte("12345678901234567890123456789012"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s2, err := New([]byte("abcdefghijklmnopqrstuvwxyz123456"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := s1.Encode("sid", "value")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Only s2 is given, so DecodeMulti fails with a MultiError; errors.Is
-	// must see through it to the wrapped ErrDecryptionFailed.
-	var dst string
-	if err = DecodeMulti("sid", encoded, &dst, s2); !errors.Is(err, ErrDecryptionFailed) {
-		t.Fatalf("Expected ErrDecryptionFailed via MultiError, got %#v", err)
 	}
 }
 
