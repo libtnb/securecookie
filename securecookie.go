@@ -6,6 +6,7 @@ package securecookie
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/gob"
@@ -16,6 +17,8 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// Register []any so that GobEncoder can handle nested values inside
+// map[string]any cookies without requiring callers to do it themselves.
 func init() {
 	gob.Register([]any{})
 }
@@ -32,14 +35,17 @@ var (
 	ErrTimestampExpired = fmt.Errorf("the timestamp is expired")
 )
 
+// defaultTimeFunc returns the current Unix timestamp, in seconds.
+func defaultTimeFunc() int64 {
+	return time.Now().UTC().Unix()
+}
+
 var DefaultOptions = &Options{
 	MinAge:     0,
 	MaxAge:     86400 * 30,
 	MaxLength:  4096,
 	Serializer: JSONEncoder{},
-	TimeFunc: func() int64 {
-		return time.Now().UTC().Unix()
-	},
+	TimeFunc:   defaultTimeFunc,
 }
 
 // Codec defines an interface to encode and decode cookie values.
@@ -50,99 +56,106 @@ type Codec interface {
 
 // New returns a new SecureCookie.
 //
-// Key is required and must be 32 bytes, used to authenticate and
-// encrypt cookie values.
+// Key is required and must be 32 bytes, used to authenticate and encrypt
+// cookie values. The same length requirement applies to every key in
+// options.RotatedKeys.
+//
+// If options is nil, DefaultOptions is used. The provided Options value is
+// only read, never modified.
 //
 // Note that keys created using GenerateRandomKey() are not automatically
 // persisted. New keys will be created when the application is restarted, and
 // previously issued cookies will not be able to be decoded.
 func New(key []byte, options *Options) (*SecureCookie, error) {
-	if len(key) != chacha20poly1305.KeySize {
-		return nil, ErrKeyLength
-	}
 	if options == nil {
 		options = DefaultOptions
 	}
-	if options.Serializer == nil {
-		options.Serializer = DefaultOptions.Serializer
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, ErrKeyLength
 	}
-	if options.TimeFunc == nil {
-		options.TimeFunc = func() int64 {
-			return time.Now().UTC().Unix()
+	rotated := make([]cipher.AEAD, len(options.RotatedKeys))
+	for i, k := range options.RotatedKeys {
+		if rotated[i], err = chacha20poly1305.NewX(k); err != nil {
+			return nil, ErrKeyLength
 		}
 	}
 	s := &SecureCookie{
-		key:         key,
-		rotatedKeys: options.RotatedKeys,
-		minAge:      options.MinAge,
-		maxAge:      options.MaxAge,
-		maxLength:   options.MaxLength,
-		sz:          options.Serializer,
-		timeFunc:    options.TimeFunc,
+		aead:         aead,
+		rotatedAEADs: rotated,
+		minAge:       options.MinAge,
+		maxAge:       options.MaxAge,
+		maxLength:    options.MaxLength,
+		sz:           options.Serializer,
+		timeFunc:     options.TimeFunc,
+	}
+	// Defaults are filled in on the SecureCookie itself so the caller's
+	// Options value is left untouched.
+	if s.sz == nil {
+		s.sz = DefaultOptions.Serializer
+	}
+	if s.timeFunc == nil {
+		s.timeFunc = defaultTimeFunc
 	}
 	return s, nil
 }
 
 type Options struct {
+	// RotatedKeys holds previous keys, tried in order when decoding so that
+	// cookies issued before a key rotation remain valid. They are never used
+	// for encoding. Each key must be 32 bytes.
 	RotatedKeys [][]byte
-	MinAge      int64
-	MaxAge      int64
-	MaxLength   int
-	Serializer  Serializer
-	TimeFunc    func() int64
+	// MinAge is the minimum age of a cookie, in seconds. Cookies encoded
+	// less than MinAge seconds ago are rejected. 0 disables the check.
+	MinAge int64
+	// MaxAge is the maximum age of a cookie, in seconds. Cookies encoded
+	// more than MaxAge seconds ago are rejected. 0 disables the check.
+	MaxAge int64
+	// MaxLength is the maximum length of an encoded cookie value, in bytes.
+	// 0 disables the check. Note that browsers commonly limit the whole
+	// cookie (name, value and attributes) to 4096 bytes.
+	MaxLength int
+	// Serializer converts values to and from bytes. Defaults to JSONEncoder.
+	Serializer Serializer
+	// TimeFunc returns the current Unix timestamp, in seconds. It exists so
+	// tests can supply a fake clock. Defaults to time.Now().UTC().Unix().
+	TimeFunc func() int64
 }
 
-// SecureCookie encodes and decodes authenticated and optionally encrypted
-// cookie values.
+// SecureCookie encodes and decodes authenticated and encrypted cookie
+// values. It is safe for concurrent use by multiple goroutines, as long as
+// the configured Serializer and TimeFunc are (the defaults are).
 type SecureCookie struct {
-	key         []byte
-	rotatedKeys [][]byte
-	maxLength   int
-	maxAge      int64
-	minAge      int64
-	sz          Serializer
-	// For testing purposes, the function that returns the current timestamp.
-	// If not set, it will use time.Now().UTC().Unix().
+	aead         cipher.AEAD
+	rotatedAEADs []cipher.AEAD
+	maxLength    int
+	maxAge       int64
+	minAge       int64
+	sz           Serializer
+	// timeFunc returns the current timestamp; injectable for testing.
 	timeFunc func() int64
 }
 
 // Encode encodes a cookie value.
 //
-// It serializes, optionally encrypts, signs with a message authentication code,
-// and finally encodes the value.
+// It serializes the value, encrypts and authenticates it together with a
+// timestamp using the primary key, and finally encodes the result with
+// base64. Rotated keys are never used for encoding.
 //
-// The name argument is the cookie name. It is used to authenticate the cookie.
-// The value argument is the value to be encoded. It can be any value that can
-// be encoded using the currently selected serializer.
-//
-// It is the client's responsibility to ensure that value, when encoded using
-// the current serialization/encryption settings on s and then base64-encoded,
-// is shorter than the maximum permissible length.
+// The name argument is the cookie name. It is bound to the ciphertext as
+// additional authenticated data, so a value issued for one cookie name
+// cannot be replayed under another.
 func (s *SecureCookie) Encode(name string, value any) (string, error) {
-	var err error
-	var errors MultiError
-	var b []byte
 	// 1. Serialize.
-	if b, err = s.sz.Serialize(value); err != nil {
+	b, err := s.sz.Serialize(value)
+	if err != nil {
 		return "", err
 	}
 	// 2. Encrypt.
-	key := s.key
-	index := -1
-walk:
-	// We can't directly use 'b' here because if the encryption fails, we need
-	// to retry with a different key.
-	enc, err := s.encrypt([]byte(name), key, b)
-	if err != nil {
-		errors = append(errors, err)
-		if index++; index < len(s.rotatedKeys) {
-			key = s.rotatedKeys[index]
-			goto walk
-		} else {
-			return "", errors
-		}
+	if b, err = s.encrypt([]byte(name), b); err != nil {
+		return "", err
 	}
-	b = encode(enc)
+	b = encode(b)
 	// 3. Check length.
 	if s.maxLength != 0 && len(b) > s.maxLength {
 		return "", ErrValueTooLong
@@ -153,15 +166,16 @@ walk:
 
 // Decode decodes a cookie value.
 //
-// It decodes, verifies a message authentication code, optionally decrypts and
-// finally deserializes the value.
+// It decodes the base64 value, decrypts and verifies the ciphertext, checks
+// the embedded timestamp against MinAge/MaxAge, and finally deserializes
+// the value into dst, which must be a pointer.
 //
 // The name argument is the cookie name. It must be the same name used when
-// it was encoded. The value argument is the encoded cookie value. The dst
-// argument is where the cookie will be decoded. It must be a pointer.
+// it was encoded.
+//
+// It returns the timestamp at which the cookie was encoded whenever it is
+// known, even if a timestamp or deserialization error is returned alongside.
 func (s *SecureCookie) Decode(name, value string, dst any) (int64, error) {
-	var err error
-	var errors MultiError
 	// 1. Check length.
 	if s.maxLength != 0 && len(value) > s.maxLength {
 		return 0, ErrValueTooLong
@@ -171,27 +185,22 @@ func (s *SecureCookie) Decode(name, value string, dst any) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// 3. Decrypt.
-	key := s.key
-	index := -1
-walk:
-	// We can't directly use 'b' here because if the decryption fails, we need
-	// to retry with a different key.
-	dec, err := s.decrypt([]byte(name), key, b)
-	if err != nil {
-		errors = append(errors, err)
-		if index++; index < len(s.rotatedKeys) {
-			key = s.rotatedKeys[index]
-			goto walk
-		} else {
-			return 0, errors
-		}
+	// 3. Decrypt, trying the primary key first and then any rotated keys so
+	// that cookies issued before a key rotation remain valid.
+	ad := []byte(name)
+	dec, err := decrypt(s.aead, ad, b)
+	for i := 0; err != nil && i < len(s.rotatedAEADs); i++ {
+		dec, err = decrypt(s.rotatedAEADs[i], ad, b)
 	}
-	parts := bytes.SplitN(dec, []byte("|"), 2)
-	if len(parts) != 2 {
+	if err != nil {
+		return 0, err
+	}
+	// 4. Validate the timestamp.
+	tsPart, payload, found := bytes.Cut(dec, []byte("|"))
+	if !found {
 		return 0, ErrDecryptionFailed
 	}
-	ts, err := strconv.ParseInt(string(parts[0]), 10, 64)
+	ts, err := strconv.ParseInt(string(tsPart), 10, 64)
 	if err != nil {
 		return 0, ErrTimestampInvalid
 	}
@@ -202,8 +211,8 @@ walk:
 	if s.maxAge != 0 && ts < now-s.maxAge {
 		return ts, ErrTimestampExpired
 	}
-	// 4. Deserialize.
-	if err = s.sz.Deserialize(parts[1], dst); err != nil {
+	// 5. Deserialize.
+	if err = s.sz.Deserialize(payload, dst); err != nil {
 		return ts, err
 	}
 	// Done.
@@ -211,45 +220,40 @@ walk:
 }
 
 // timestamp returns the current timestamp, in seconds.
-//
-// For testing purposes, the function that generates the timestamp can be
-// overridden. If not set, it will return time.Now().UTC().Unix().
 func (s *SecureCookie) timestamp() int64 {
 	return s.timeFunc()
 }
 
-// encrypt encrypts a value using the given key, nonce will be generated
-// and prepended to the ciphertext.
-func (s *SecureCookie) encrypt(name, key, value []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(key)
-	if err != nil {
+// encrypt seals "timestamp|value" using the primary key, so that the
+// timestamp can be verified after decrypting but before deserializing. A
+// random nonce is generated and prepended to the ciphertext, and ad (the
+// cookie name) is bound as additional authenticated data.
+func (s *SecureCookie) encrypt(ad, value []byte) ([]byte, error) {
+	plaintext := make([]byte, 0, 20+1+len(value))
+	plaintext = strconv.AppendInt(plaintext, s.timestamp(), 10)
+	plaintext = append(plaintext, '|')
+	plaintext = append(plaintext, value...)
+	// The buffer holds the nonce and reserves capacity for Seal to append
+	// the ciphertext in place, without another allocation.
+	nonce := make([]byte, s.aead.NonceSize(), s.aead.NonceSize()+len(plaintext)+s.aead.Overhead())
+	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	nonce := GenerateRandomKey(aead.NonceSize())
-	if _, err = rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	// We create a buffer of "timestamp|ciphertext" so that we can verify
-	// the validity of the timestamp after decrypting, but before deserializing.
-	buf := new(bytes.Buffer)
-	buf.WriteString(strconv.FormatInt(s.timestamp(), 10) + "|")
-	buf.Write(value)
-	value = aead.Seal(nonce, nonce, buf.Bytes(), name)
-	return value, nil
+	return s.aead.Seal(nonce, nonce, plaintext, ad), nil
 }
 
-// decrypt decrypts a value using the given key, nonce will be extracted from
-// the ciphertext.
-func (s *SecureCookie) decrypt(name, key, value []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(key)
-	if err != nil {
-		return nil, err
-	}
+// decrypt opens a value sealed by encrypt, with the nonce extracted from
+// the head of the value. Any failure is reported as ErrDecryptionFailed.
+func decrypt(aead cipher.AEAD, ad, value []byte) ([]byte, error) {
 	if len(value) < aead.NonceSize() {
 		return nil, ErrDecryptionFailed
 	}
 	nonce, ciphertext := value[:aead.NonceSize()], value[aead.NonceSize():]
-	return aead.Open(nil, nonce, ciphertext, name)
+	dec, err := aead.Open(nil, nonce, ciphertext, ad)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrDecryptionFailed, err)
+	}
+	return dec, nil
 }
 
 // Encoding -------------------------------------------------------------------
@@ -274,14 +278,12 @@ func decode(value []byte) ([]byte, error) {
 // Helpers --------------------------------------------------------------------
 
 // GenerateRandomKey creates a random key with the given length in bytes.
-// On failure, returns nil.
+// It panics if the system's secure random number source fails, in which
+// case the process should not continue.
 //
 // Note that keys created using `GenerateRandomKey()` are not automatically
 // persisted. New keys will be created when the application is restarted, and
 // previously issued cookies will not be able to be decoded.
-//
-// Callers should explicitly check for the possibility of a nil return, treat
-// it as a failure of the system random number generator, and not continue.
 func GenerateRandomKey(length int) []byte {
 	b := make([]byte, length)
 	if _, err := rand.Read(b); err != nil {
@@ -356,4 +358,10 @@ func (m MultiError) Error() string {
 		return s + " (and 1 other error)"
 	}
 	return fmt.Sprintf("%s (and %d other errors)", s, n-1)
+}
+
+// Unwrap returns the grouped errors, allowing errors.Is and errors.As to
+// examine each of them.
+func (m MultiError) Unwrap() []error {
+	return m
 }

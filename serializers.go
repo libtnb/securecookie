@@ -48,21 +48,12 @@ func (e GobEncoder) Deserialize(src []byte, dst any) error {
 
 // Serialize encodes a value using encoding/json.
 func (e JSONEncoder) Serialize(src any) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	enc := json.NewEncoder(buf)
-	if err := enc.Encode(src); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return json.Marshal(src)
 }
 
 // Deserialize decodes a value using encoding/json.
 func (e JSONEncoder) Deserialize(src []byte, dst any) error {
-	dec := json.NewDecoder(bytes.NewReader(src))
-	if err := dec.Decode(dst); err != nil {
-		return err
-	}
-	return nil
+	return json.Unmarshal(src, dst)
 }
 
 // Serialize passes a []byte through as-is.

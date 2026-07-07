@@ -20,6 +20,13 @@ jobs:
           cache: true
           go-version: ${{ matrix.go }}
       - name: Install dependencies
-        run: go mod tidy
+        run: go mod download
       - name: Run tests
-        run: go test -timeout 1h ./...
+        run: go test -race ./...
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: stable

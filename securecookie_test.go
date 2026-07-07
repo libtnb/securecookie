@@ -8,12 +8,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
-
-	fuzz "github.com/google/gofuzz"
+	"unicode/utf8"
 )
 
 var testCookies = []any{
@@ -37,7 +37,7 @@ func TestSecureCookie(t *testing.T) {
 		"baz": float64(128),
 	}
 
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		// Running this multiple times to check if any special character
 		// breaks encoding/decoding.
 		encoded, err := s1.Encode("sid", value)
@@ -263,32 +263,40 @@ type Cookie struct {
 }
 
 func FuzzEncodeDecode(f *testing.F) {
-	fuzzer := fuzz.New()
-	s1, err := New([]byte("12345678901234567890123456789012"), DefaultOptions)
+	// MaxLength is left at 0 (unlimited) so long fuzzed values round-trip.
+	s1, err := New([]byte("12345678901234567890123456789012"), &Options{})
 	if err != nil {
 		f.Fatal(err)
 	}
-	s1.maxLength = 0
 
-	for i := 0; i < 100000; i++ {
-		var c Cookie
-		fuzzer.Fuzz(&c)
+	seeds := []Cookie{
+		{false, 0, ""},
+		{true, 1, "foo"},
+		{true, -1, "|"},
+		{false, 42, `{"json":"looking|value"}`},
+		{true, math.MaxInt, strings.Repeat("x", 8192)},
+		{false, math.MinInt, "\x00\x01\x02"},
+		{true, 7, "héllo 世界 🍪"},
+	}
+	for _, c := range seeds {
 		f.Add(c.B, c.I, c.S)
 	}
 
 	f.Fuzz(func(t *testing.T, b bool, i int, s string) {
+		if !utf8.ValidString(s) {
+			t.Skip("encoding/json cannot round-trip invalid UTF-8")
+		}
 		c := Cookie{b, i, s}
 		encoded, err := s1.Encode("sid", c)
 		if err != nil {
-			t.Errorf("Encode failed: %#v", err)
+			t.Fatalf("Encode failed: %#v", err)
 		}
 		dc := Cookie{}
-		_, err = s1.Decode("sid", encoded, &dc)
-		if err != nil {
-			t.Errorf("Decode failed: %#v", err)
+		if _, err = s1.Decode("sid", encoded, &dc); err != nil {
+			t.Fatalf("Decode failed: %#v", err)
 		}
 		if dc != c {
-			t.Fatalf("Expected %#v, got %#v.", s, dc)
+			t.Fatalf("Expected %#v, got %#v.", c, dc)
 		}
 	})
 }
@@ -330,7 +338,12 @@ func TestEncodeDecodeWithRotatedKeys(t *testing.T) {
 }
 
 func TestEncodeDecodeWithExpiredTimestamp(t *testing.T) {
-	s1, err := New([]byte("12345678901234567890123456789012"), &Options{MaxAge: 1})
+	now := time.Now().UTC().Unix()
+	current := now
+	s1, err := New([]byte("12345678901234567890123456789012"), &Options{
+		MaxAge:   1,
+		TimeFunc: func() int64 { return current },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +352,7 @@ func TestEncodeDecodeWithExpiredTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2 * time.Second)
+	current = now + 2 // advance the fake clock past MaxAge
 	dst := make(map[string]any)
 	if _, err = s1.Decode("sid", encoded, &dst); err == nil {
 		t.Fatal("Expected failure due to expired timestamp.")
@@ -387,5 +400,120 @@ func TestEncodeDecodeWithMaxLengthExceeded(t *testing.T) {
 	}
 	if !errors.Is(err, ErrValueTooLong) {
 		t.Fatalf("Expected ErrValueTooLong, got %#v", err)
+	}
+}
+
+func TestNewWithInvalidRotatedKey(t *testing.T) {
+	invalidKeys := [][]byte{
+		nil,
+		[]byte("short"),
+		[]byte("123456789012345678901234567890123"), // 33 bytes
+	}
+	for _, k := range invalidKeys {
+		s, err := New([]byte("12345678901234567890123456789012"), &Options{RotatedKeys: [][]byte{k}})
+		if s != nil {
+			t.Fatalf("Expected nil SecureCookie for rotated key %q", k)
+		}
+		if !errors.Is(err, ErrKeyLength) {
+			t.Fatalf("Expected ErrKeyLength, got %#v", err)
+		}
+	}
+}
+
+func TestDecodeWrongKeyError(t *testing.T) {
+	s1, err := New([]byte("12345678901234567890123456789012"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := New([]byte("abcdefghijklmnopqrstuvwxyz123456"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s1.Encode("sid", "value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dst string
+	if _, err = s2.Decode("sid", encoded, &dst); !errors.Is(err, ErrDecryptionFailed) {
+		t.Fatalf("Expected ErrDecryptionFailed, got %#v", err)
+	}
+}
+
+func TestDecodeWrongNameError(t *testing.T) {
+	s1, err := New([]byte("12345678901234567890123456789012"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s1.Encode("sid", "value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dst string
+	if _, err = s1.Decode("other", encoded, &dst); !errors.Is(err, ErrDecryptionFailed) {
+		t.Fatalf("Expected ErrDecryptionFailed, got %#v", err)
+	}
+}
+
+func TestNewDoesNotMutateOptions(t *testing.T) {
+	opts := &Options{}
+	if _, err := New([]byte("12345678901234567890123456789012"), opts); err != nil {
+		t.Fatal(err)
+	}
+	if opts.Serializer != nil || opts.TimeFunc != nil {
+		t.Fatalf("New mutated the caller's Options: %#v", opts)
+	}
+}
+
+func TestMultiErrorUnwrap(t *testing.T) {
+	s1, err := New([]byte("12345678901234567890123456789012"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := New([]byte("abcdefghijklmnopqrstuvwxyz123456"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s1.Encode("sid", "value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only s2 is given, so DecodeMulti fails with a MultiError; errors.Is
+	// must see through it to the wrapped ErrDecryptionFailed.
+	var dst string
+	if err = DecodeMulti("sid", encoded, &dst, s2); !errors.Is(err, ErrDecryptionFailed) {
+		t.Fatalf("Expected ErrDecryptionFailed via MultiError, got %#v", err)
+	}
+}
+
+func BenchmarkEncode(b *testing.B) {
+	s, err := New([]byte("12345678901234567890123456789012"), DefaultOptions)
+	if err != nil {
+		b.Fatal(err)
+	}
+	value := map[string]string{"foo": "bar", "user": "12345"}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err = s.Encode("sid", value); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecode(b *testing.B) {
+	s, err := New([]byte("12345678901234567890123456789012"), DefaultOptions)
+	if err != nil {
+		b.Fatal(err)
+	}
+	value := map[string]string{"foo": "bar", "user": "12345"}
+	encoded, err := s.Encode("sid", value)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		var dst map[string]string
+		if _, err = s.Decode("sid", encoded, &dst); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
