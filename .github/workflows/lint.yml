@@ -33,5 +33,3 @@ jobs:
     steps:
       - name: Run Govulncheck
         uses: golang/govulncheck-action@v1
-        with:
-          go-version-input: stable
